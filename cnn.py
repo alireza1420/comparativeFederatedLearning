@@ -2,7 +2,9 @@ import flwr as fl
 from flwr.client import NumPyClient
 # IMPORTANT: Remove or comment out 'from flwr.common import Context' if you're sticking
 # to `start_simulation` with `cid: str`. The Context object is for different setups.
+import pandas as pd
 import numpy as np
+import csv
 import torch
 import torchvision
 import torchvision.transforms as transforms
@@ -207,7 +209,8 @@ def get_evaluate_fn(model: torch.nn.Module, test_loader: DataLoader, device: tor
         accuracy = correct / total if total > 0 else 0.0
 
         print(f"Server-side evaluation: Round {server_round}, Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
-
+        data = pd.DataFrame([[server_round,avg_loss,accuracy]],columns=['Server Round','Average Loss','Accuracy'])
+        data.to_csv('random_Fedavg.csv', mode='a', index=False, header=False)
         return avg_loss, {"accuracy": accuracy}
 
     return evaluate
@@ -242,7 +245,8 @@ def main():
     history = fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=3),
+        config=fl.server.ServerConfig(num_rounds=2),
+        client_resources= {"num_cpus": 1, "num_gpus": 0.25},
         strategy=strategy,
     )
 
