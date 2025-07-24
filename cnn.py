@@ -112,7 +112,11 @@ class FlowerClient(fl.client.NumPyClient):
                 correct += (predicted == labels).sum().item()
         
         accuracy = correct / total if total > 0 else 0.0 # Handle division by zero
+        #individual local accuracy
+        data1 = pd.DataFrame([[accuracy]],columns=['Accuracy'])
+        data1.to_csv('random_Fedavg2.csv', mode='a', index=False, header=False)
         return self.get_parameters({}), len(self.train_loader.dataset), {"accuracy": accuracy}
+        
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
@@ -129,7 +133,11 @@ class FlowerClient(fl.client.NumPyClient):
         
         avg_loss = loss / total if total > 0 else 0.0 # Calculate average loss
         accuracy = correct / total if total > 0 else 0.0
+        #Calculation of each Node accuracy and average loss at each round
+        data1 = pd.DataFrame([[accuracy,avg_loss]],columns=['Accuracy','Average Loss'])
+        data1.to_csv('random_Fedavg1.csv', mode='a', index=False, header=False)
         return avg_loss, total, {"accuracy": accuracy}
+       
 
 # -------------------------------
 # Client Function (Corrected for `start_simulation`)
@@ -158,6 +166,7 @@ def fit_metrics_aggregation_fn(results: list[Tuple[fl.common.Parameters, int, Di
             for res in results
             if len(res) > 2 and isinstance(res[2], dict) and "accuracy" in res[2]
         ]
+        
         return {"avg_accuracy": float(np.mean(accuracies)) if accuracies else 0.0}
     except Exception as e:
         print(f"Aggregation error in fit_metrics_aggregation_fn: {e}")
@@ -207,7 +216,7 @@ def get_evaluate_fn(model: torch.nn.Module, test_loader: DataLoader, device: tor
         
         avg_loss = loss / len(test_loader.dataset) if len(test_loader.dataset) > 0 else 0.0
         accuracy = correct / total if total > 0 else 0.0
-
+#Centralized data
         print(f"Server-side evaluation: Round {server_round}, Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
         data = pd.DataFrame([[server_round,avg_loss,accuracy]],columns=['Server Round','Average Loss','Accuracy'])
         data.to_csv('random_Fedavg.csv', mode='a', index=False, header=False)
@@ -251,34 +260,32 @@ def main():
     )
 
     print("\n--- Final Training Summary ---")
-    
-    # Client-side Aggregated Fit Accuracy (from clients' training data)
-    print("\nClient-side Aggregated Fit Accuracy:")
-    # Check if the key exists before iterating, and access correctly
-    if "avg_accuracy" in history.metrics_distributed_fit:
-        for rnd, accuracy in history.metrics_distributed_fit["avg_accuracy"]:
-            print(f"Round {rnd} - Client Avg Fit Accuracy: {accuracy:.4f}")
-    else:
-        print("No client-side aggregated fit accuracy reported.")
 
-    # Client-side Aggregated Evaluate Accuracy (from clients' local data used for eval)
-    print("\nClient-side Aggregated Evaluate Accuracy:")
-    # Check if the key exists before iterating, and access correctly
-    if "accuracy" in history.metrics_distributed_evaluate:
-        for rnd, accuracy in history.metrics_distributed_evaluate["accuracy"]:
-            print(f"Round {rnd} - Client Avg Eval Accuracy: {accuracy:.4f}")
-    else:
-        print("No client-side aggregated evaluate accuracy reported.")
+    # Always check if the attribute exists before accessing, especially for distributed metrics
+    # which can vary based on strategy and what clients report.
 
-    # Server-side Centralized Evaluation Accuracy (most important for global model performance)
-    print("\nServer-side Centralized Evaluation Accuracy:")
-    # Check if the key exists before iterating, and access the value directly (it's not a dict here)
-    if "accuracy" in history.metrics_centralized:
-        for rnd, accuracy_value in history.metrics_centralized["accuracy"]: # Renamed to accuracy_value
-            # history.metrics_centralized for 'accuracy' directly stores (round, value) tuples
-            print(f"Round {rnd} - Server Eval Accuracy: {accuracy_value:.4f}")
-    else:
-        print("No server-side centralized evaluation accuracy reported.")
+    # Centralized Metrics (these are usually reliable and exist)
+    print("History (loss, centralized):", history.losses_centralized)
+    if 'accuracy' in history.metrics_centralized:
+        print("History (metrics, centralized, accuracy):", history.metrics_centralized['accuracy'])
+        df_centralized_acc = pd.DataFrame(history.metrics_centralized['accuracy'], columns=['Round', 'Accuracy'])
+        df_centralized_acc.to_csv('centralized_model_accuracy.csv', index=False)
+        print("Centralized model accuracy saved to centralized_model_accuracy.csv")
+
+
+    # Distributed Losses (this one should exist)
+    print("History (loss, distributed):", history.losses_distributed)
+    df_distributed_loss = pd.DataFrame(history.losses_distributed, columns=['Round', 'Loss'])
+    df_distributed_loss.to_csv('distributed_evaluation_loss.csv', index=False)
+    print("Distributed evaluation loss saved to distributed_evaluation_loss.csv")
+
+    # Distributed Fit Metrics (access by key, as you saw 'avg_accuracy' in your INFO logs)
+    # Check for the *key* in the dictionary, not an attribute name
+    if 'avg_accuracy' in history.metrics_distributed_fit:
+        print("History (metrics, distributed, fit, avg_accuracy):", history.metrics_distributed_fit['avg_accuracy'])
+        df_dist_fit_acc = pd.DataFrame(history.metrics_distributed_fit['avg_accuracy'], columns=['Round', 'Accuracy'])
+        df_dist_fit_acc.to_csv('distributed_fit_accuracy.csv', index=False)
+        print("Distributed fit accuracy saved to distributed_fit_accuracy.csv")
 
 
 if __name__ == "__main__":
