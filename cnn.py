@@ -1,4 +1,7 @@
 import flwr as fl
+from flwr.client import NumPyClient
+# IMPORTANT: Remove or comment out 'from flwr.common import Context' if you're sticking
+# to `start_simulation` with `cid: str`. The Context object is for different setups.
 import numpy as np
 import torch
 import torchvision
@@ -10,14 +13,14 @@ from torch.utils.data import DataLoader, Subset
 import time
 import random
 import collections
-from flwr.common import Context
+from typing import Dict, Tuple, Optional # Import for type hints in evaluate_fn
 
 # -------------------------------
 # Configuration
 # -------------------------------
 NUM_CLIENTS = 10
 BATCH_SIZE = 32
-EPOCHS = 1
+EPOCHS = 5 # Increased epochs for better learning
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CLIENT_PROFILES = [
@@ -54,19 +57,21 @@ transform = transforms.Compose([
 ])
 
 trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform) # <--- Global testset for server
 
 def partition_dataset(dataset, num_clients):
     partition_size = len(dataset) // num_clients
     return [list(range(i * partition_size, (i + 1) * partition_size)) for i in range(num_clients)]
 
-partitions = partition_dataset(trainset, NUM_CLIENTS)
+train_partitions = partition_dataset(trainset, NUM_CLIENTS)
 
 # -------------------------------
 # Flower Client
 # -------------------------------
 class FlowerClient(fl.client.NumPyClient):
-    def __init__(self, cid, train_loader, model, profile):
-        self.cid = cid
+    # 'cid_str' is the string ID passed directly from client_fn
+    def __init__(self, cid_str: str, train_loader, model, profile):
+        self.cid = int(cid_str) # Convert to int for internal use (e.g., indexing)
         self.model = model
         self.train_loader = train_loader
         self.profile = profile
@@ -77,8 +82,8 @@ class FlowerClient(fl.client.NumPyClient):
         return [val.cpu().numpy() for val in self.model.state_dict().values()]
 
     def set_parameters(self, parameters):
-        state_dict = dict(zip(self.model.state_dict().keys(), parameters))
-        self.model.load_state_dict({k: torch.tensor(v) for k, v in state_dict.items()})
+        state_dict = collections.OrderedDict({k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), parameters)})
+        self.model.load_state_dict(state_dict)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
@@ -97,66 +102,136 @@ class FlowerClient(fl.client.NumPyClient):
         correct, total = 0, 0
         self.model.eval()
         with torch.no_grad():
-            for images, labels in self.train_loader:
+            for images, labels in self.train_loader: # Evaluating on TRAIN loader
                 images, labels = images.to(DEVICE), labels.to(DEVICE)
                 outputs = self.model(images)
                 _, predicted = torch.max(outputs, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
-
-        return self.get_parameters({}), len(self.train_loader.dataset), {"accuracy": correct / total}
+        
+        accuracy = correct / total if total > 0 else 0.0 # Handle division by zero
+        return self.get_parameters({}), len(self.train_loader.dataset), {"accuracy": accuracy}
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         self.model.eval()
         correct, total, loss = 0, 0, 0.0
         with torch.no_grad():
-            for images, labels in self.train_loader:
+            for images, labels in self.train_loader: # Evaluating on TRAIN loader
                 images, labels = images.to(DEVICE), labels.to(DEVICE)
                 outputs = self.model(images)
                 loss += self.criterion(outputs, labels).item()
                 _, predicted = torch.max(outputs, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
-        return loss / total, total, {"accuracy": correct / total}
+        
+        avg_loss = loss / total if total > 0 else 0.0 # Calculate average loss
+        accuracy = correct / total if total > 0 else 0.0
+        return avg_loss, total, {"accuracy": accuracy}
 
 # -------------------------------
-# Client Function
+# Client Function (Corrected for `start_simulation`)
 # -------------------------------
-def client_fn(client_id: str):
-    cid = int(client_id)
-    indices = partitions[cid]
+def client_fn(cid: str) -> fl.client.Client: # <--- CORRECTED: Takes 'cid' directly
+    
+    client_id_as_int = int(cid) # Convert cid string to int for indexing
+
+    indices = train_partitions[client_id_as_int] 
     client_data = Subset(trainset, indices)
     train_loader = DataLoader(client_data, batch_size=BATCH_SIZE, shuffle=True)
     model = CNN().to(DEVICE)
-    profile = CLIENT_PROFILES[cid]
+    
+    profile = CLIENT_PROFILES[client_id_as_int]
+    
     return FlowerClient(cid, train_loader, model, profile).to_client()
 
 # -------------------------------
-# Metric Aggregation
+# Metric Aggregation Functions (Robustified)
 # -------------------------------
-def fit_metrics_aggregation_fn(results):
+def fit_metrics_aggregation_fn(results: list[Tuple[fl.common.Parameters, int, Dict[str, fl.common.Scalar]]]):
     try:
-        accuracies = [fit_res.metrics["accuracy"] for fit_res in results if "accuracy" in fit_res.metrics]
-        return {"avg_accuracy": float(np.mean(accuracies))}
+        # results is a list of (parameters, num_examples, metrics)
+        accuracies = [
+            res[2]["accuracy"]
+            for res in results
+            if len(res) > 2 and isinstance(res[2], dict) and "accuracy" in res[2]
+        ]
+        return {"avg_accuracy": float(np.mean(accuracies)) if accuracies else 0.0}
     except Exception as e:
-        print(f"Aggregation error: {e}")
+        print(f"Aggregation error in fit_metrics_aggregation_fn: {e}")
         return {"avg_accuracy": 0.0}
 
 
-def evaluate_metrics_aggregation_fn(results):
-    accuracies = [r.metrics["accuracy"] for _, r in results if "accuracy" in r.metrics]
-    return {"accuracy": float(np.mean(accuracies))} if accuracies else {}
+def evaluate_metrics_aggregation_fn(results: list[Tuple[float, int, Dict[str, fl.common.Scalar]]]):
+    try:
+        # results is a list of (loss, num_examples, metrics)
+        accuracies = [
+            res[2]["accuracy"]
+            for res in results
+            if len(res) > 2 and isinstance(res[2], dict) and "accuracy" in res[2]
+        ]
+        return {"accuracy": float(np.mean(accuracies)) if accuracies else 0.0}
+    except Exception as e:
+        print(f"Aggregation error in evaluate_metrics_aggregation_fn: {e}")
+        return {"accuracy": 0.0}
 
 # -------------------------------
-# Strategy
+# Centralized Evaluation Function for Server
 # -------------------------------
+def get_evaluate_fn(model: torch.nn.Module, test_loader: DataLoader, device: torch.device):
+    """Returns an evaluation function for centralized evaluation."""
+
+    def evaluate(
+        server_round: int,
+        parameters: fl.common.NDArrays,
+        config: Dict[str, fl.common.Scalar],
+    ) -> Optional[Tuple[float, Dict[str, fl.common.Scalar]]]:
+        # Load model parameters to the server's global model
+        state_dict = collections.OrderedDict({k: torch.tensor(v) for k, v in zip(model.state_dict().keys(), parameters)})
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        correct, total, loss = 0, 0, 0.0
+        criterion = nn.CrossEntropyLoss()
+
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                loss += criterion(outputs, labels).item()
+                _, predicted = torch.max(outputs, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        
+        avg_loss = loss / len(test_loader.dataset) if len(test_loader.dataset) > 0 else 0.0
+        accuracy = correct / total if total > 0 else 0.0
+
+        print(f"Server-side evaluation: Round {server_round}, Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
+
+        return avg_loss, {"accuracy": accuracy}
+
+    return evaluate
+
+
+# -------------------------------
+# Strategy (UPDATED with evaluate_fn and initial_parameters)
+# -------------------------------
+# Instantiate a model for the server to use for centralized evaluation
+global_model = CNN().to(DEVICE)
+global_test_loader = DataLoader(testset, batch_size=BATCH_SIZE) # Use the globally loaded testset
+
 strategy = fl.server.strategy.FedAvg(
     fraction_fit=0.5,
-    fraction_evaluate=0.5,
+    fraction_evaluate=0.5, # Clients also perform evaluation and report
     min_fit_clients=5,
     min_available_clients=NUM_CLIENTS,
     fit_metrics_aggregation_fn=fit_metrics_aggregation_fn,
+    evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
+    evaluate_fn=get_evaluate_fn(global_model, global_test_loader, DEVICE), # <--- Centralized evaluation
+    # Provide initial parameters for the server's strategy
+    initial_parameters=fl.common.ndarrays_to_parameters(
+        [val.cpu().numpy() for val in global_model.state_dict().values()]
+    ),
 )
 
 
@@ -167,15 +242,40 @@ def main():
     history = fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=10),
+        config=fl.server.ServerConfig(num_rounds=3),
         strategy=strategy,
     )
 
-    print("\n--- Training Summary ---")
-    for rnd, metrics in enumerate(history.metrics_centralized.get("fit", []), start=1):
-        print(f"Round {rnd} - Fit Accuracy: {metrics['accuracy']:.4f}")
-    for rnd, metrics in enumerate(history.metrics_centralized.get("evaluate", []), start=1):
-        print(f"Round {rnd} - Eval Accuracy: {metrics['accuracy']:.4f}")
+    print("\n--- Final Training Summary ---")
+    
+    # Client-side Aggregated Fit Accuracy (from clients' training data)
+    print("\nClient-side Aggregated Fit Accuracy:")
+    # Check if the key exists before iterating, and access correctly
+    if "avg_accuracy" in history.metrics_distributed_fit:
+        for rnd, accuracy in history.metrics_distributed_fit["avg_accuracy"]:
+            print(f"Round {rnd} - Client Avg Fit Accuracy: {accuracy:.4f}")
+    else:
+        print("No client-side aggregated fit accuracy reported.")
+
+    # Client-side Aggregated Evaluate Accuracy (from clients' local data used for eval)
+    print("\nClient-side Aggregated Evaluate Accuracy:")
+    # Check if the key exists before iterating, and access correctly
+    if "accuracy" in history.metrics_distributed_evaluate:
+        for rnd, accuracy in history.metrics_distributed_evaluate["accuracy"]:
+            print(f"Round {rnd} - Client Avg Eval Accuracy: {accuracy:.4f}")
+    else:
+        print("No client-side aggregated evaluate accuracy reported.")
+
+    # Server-side Centralized Evaluation Accuracy (most important for global model performance)
+    print("\nServer-side Centralized Evaluation Accuracy:")
+    # Check if the key exists before iterating, and access the value directly (it's not a dict here)
+    if "accuracy" in history.metrics_centralized:
+        for rnd, accuracy_value in history.metrics_centralized["accuracy"]: # Renamed to accuracy_value
+            # history.metrics_centralized for 'accuracy' directly stores (round, value) tuples
+            print(f"Round {rnd} - Server Eval Accuracy: {accuracy_value:.4f}")
+    else:
+        print("No server-side centralized evaluation accuracy reported.")
+
 
 if __name__ == "__main__":
     main()
