@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import csv
 import torch
+import pynvml
 import torchvision
 import torchvision.transforms as transforms
 import torch.nn as nn
@@ -31,6 +32,7 @@ DEVICE = torch.device("cuda")
 # For GPU, 1.0 means one client gets full GPU, 0.0 means CPU only.
 # Fractional (e.g., 0.25) can be used for scheduling but doesn't mean true concurrent sharing on one GPU.
 CLIENT_RESOURCES = {"num_cpus": 2, "num_gpus": 1.0} # Start with 0.0 GPU if unsure
+
 
 CLIENT_PROFILES = [
     {"speed": random.uniform(0.5, 2.0), "latency": random.uniform(0.1, 1.0)}
@@ -94,6 +96,12 @@ class FlowerClient(fl.client.NumPyClient):
         self.train_loader = train_loader
         self.profile = profile
         self.criterion = nn.CrossEntropyLoss()
+        try:
+            pynvml.nvmlInit()
+        except pynvml.NVMLError_AlreadyInitialized:
+            pass  # Safe to ignore
+        except pynvml.NVMLError as e:
+            print(f"NVML init failed: {e}")
 
     def get_parameters(self, config):
         time.sleep(self.profile['latency'])
@@ -105,12 +113,18 @@ class FlowerClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
+        #Handels measuring GPU ussage
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0) 
+        util_before = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        gpu_before = util_before.gpu
+
         self.model.train()
         optimizer = optim.SGD(self.model.parameters(), lr=0.01)
         time.sleep(self.profile['speed'])
 
         # Start CPU usage monitoring
         process = psutil.Process()
+
         cpu_before = process.cpu_percent(interval=None) # Non-blocking
 
         for _ in range(EPOCHS):
@@ -120,7 +134,13 @@ class FlowerClient(fl.client.NumPyClient):
                 loss = self.criterion(self.model(images), labels)
                 loss.backward()
                 optimizer.step()
-        
+        # Calculates GPU usage After Training
+        util_after = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        gpu_after = util_after.gpu
+
+        gpu_diff = abs(gpu_after - gpu_before)
+
+
         # Calculate CPU usage AFTER training
         cpu_after = process.cpu_percent(interval=None) # Non-blocking
         cpu_diff = cpu_after - cpu_before if cpu_after >= cpu_before else cpu_before - cpu_after # Simple diff
@@ -138,12 +158,18 @@ class FlowerClient(fl.client.NumPyClient):
         accuracy = correct / total if total > 0 else 0.0
         
         # Return CPU usage as a metric
-        return self.get_parameters({}), len(self.train_loader.dataset), {"accuracy": accuracy, "cpu_usage_percent": cpu_diff}
+        return self.get_parameters({}), len(self.train_loader.dataset), {"accuracy": accuracy,
+                                                                          "cpu_usage_percent": cpu_diff,
+                                                                          "gpu_usage_percent":gpu_diff}
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         self.model.eval()
-        
+
+           #Handels measuring GPU ussage
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0) 
+        util_before = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        gpu_before = util_before.gpu
         # Start CPU usage monitoring
         process = psutil.Process()
         cpu_before = process.cpu_percent(interval=None) # Non-blocking
@@ -157,7 +183,12 @@ class FlowerClient(fl.client.NumPyClient):
                 _, predicted = torch.max(outputs, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
-        
+                # Calculates GPU usage After Training
+        util_after = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        gpu_after = util_after.gpu
+
+        gpu_diff = abs(gpu_after - gpu_before)
+
         # Calculate CPU usage AFTER evaluation
         cpu_after = process.cpu_percent(interval=None) # Non-blocking
         cpu_diff = cpu_after - cpu_before if cpu_after >= cpu_before else cpu_before - cpu_after # Simple diff
@@ -165,8 +196,10 @@ class FlowerClient(fl.client.NumPyClient):
         avg_loss = loss / total if total > 0 else 0.0 # Calculate average loss
         accuracy = correct / total if total > 0 else 0.0
         
-        # Return CPU usage as a metric
-        return avg_loss, total, {"accuracy": accuracy, "cpu_usage_percent": cpu_diff}
+        print(" heyyyyyyyyyyyyyyyy this is Gpu:",gpu_diff,"and this is",cpu_diff)
+        # Return CPU & GPU usage as a metric
+        return avg_loss, total, {"accuracy": accuracy, "cpu_usage_percent": cpu_diff,
+                                 "gpu_usage_percent": gpu_diff}
 
 # -------------------------------
 # Client Function
@@ -189,12 +222,21 @@ def client_fn(cid: str) -> fl.client.Client:
 def fit_metrics_aggregation_fn(results: List[Tuple[fl.common.Parameters, int, Dict[str, fl.common.Scalar]]]):
     accuracies = []
     cpu_usages = []
+    gpu_usages = []
+    print("we need to debug this fffffffffiiiiiiiiitttttttt",results)
+
     for res in results:
-        if len(res) > 2 and isinstance(res[2], dict):
-            if "accuracy" in res[2]:
-                accuracies.append(res[2]["accuracy"])
-            if "cpu_usage_percent" in res[2]:
-                cpu_usages.append(res[2]["cpu_usage_percent"])
+        print(res[1]["accuracy"])
+           
+        accuracies.append(res[1]["accuracy"])
+            
+        cpu_usages.append(res[1]["cpu_usage_percent"])
+            
+        gpu_usages.append(res[1]["gpu_usage_percent"])
+        
+    print("this is acaaaaaacuracies in evaluate metric aggregation",accuracies)
+    print("this is cpu_usages in evaluate metric aggregation",cpu_usages)
+    print("this is gpu_usages in evaluate metric aggregation",gpu_usages)
     
     aggregated_metrics = {}
     if accuracies:
@@ -206,18 +248,29 @@ def fit_metrics_aggregation_fn(results: List[Tuple[fl.common.Parameters, int, Di
         aggregated_metrics["avg_cpu_usage_percent"] = float(np.mean(cpu_usages))
     else:
         aggregated_metrics["avg_cpu_usage_percent"] = 0.0
+    if gpu_usages:
+        aggregated_metrics["avg_gpu_usage_percent"] = float(np.mean(gpu_usages))
+    else:
+        aggregated_metrics["avg_gpu_usage_percent"] = 1.55
 
     return aggregated_metrics
 
 def evaluate_metrics_aggregation_fn(results: List[Tuple[float, int, Dict[str, fl.common.Scalar]]]):
     accuracies = []
     cpu_usages = []
+    gpu_usages = []
+    print("evaluateeeeeeeeeeee")
     for res in results:
-        if len(res) > 2 and isinstance(res[2], dict):
-            if "accuracy" in res[2]:
-                accuracies.append(res[2]["accuracy"])
-            if "cpu_usage_percent" in res[2]:
-                cpu_usages.append(res[2]["cpu_usage_percent"])
+        print(res[1]["accuracy"])
+           
+        accuracies.append(res[1]["accuracy"])
+            
+        cpu_usages.append(res[1]["cpu_usage_percent"])
+            
+        gpu_usages.append(res[1]["gpu_usage_percent"])
+    print("this is acaaaaaacuracies in evaluate metric aggregation",accuracies)
+    print("this is cpu_usages in evaluate metric aggregation",cpu_usages)
+    print("this is gpu_usages in evaluate metric aggregation",gpu_usages)
     
     aggregated_metrics = {}
     if accuracies:
@@ -229,6 +282,11 @@ def evaluate_metrics_aggregation_fn(results: List[Tuple[float, int, Dict[str, fl
         aggregated_metrics["avg_cpu_usage_percent"] = float(np.mean(cpu_usages))
     else:
         aggregated_metrics["avg_cpu_usage_percent"] = 0.0
+    if gpu_usages:
+        aggregated_metrics["avg_gpu_usage_percent"] = float(np.mean(gpu_usages))
+    else:
+        aggregated_metrics["avg_gpu_usage_percent"] = 1.55
+    
 
     return aggregated_metrics
 
@@ -380,19 +438,26 @@ def main():
         print("Distributed fit CPU usage saved to distributed_fit_cpu_usage.csv")
 
 
-    # Distributed Evaluate Metrics (including average CPU usage)
-    # The `evaluate_metrics_aggregation_fn` aggregates metrics reported by clients during their `evaluate` call.
-    if 'accuracy' in history.metrics_distributed_evaluate:
-        print("History (metrics, distributed, evaluate, accuracy):", history.metrics_distributed_evaluate['accuracy'])
-        df_dist_eval_acc = pd.DataFrame(history.metrics_distributed_evaluate['accuracy'], columns=['Round', 'Accuracy'])
-        df_dist_eval_acc.to_csv('distributed_eval_accuracy.csv', index=False)
-        print("Distributed evaluate accuracy saved to distributed_eval_accuracy.csv")
+    # # Distributed Evaluate Metrics (including average CPU usage)
+    # # The `evaluate_metrics_aggregation_fn` aggregates metrics reported by clients during their `evaluate` call.
+    # if 'accuracy' in history.metrics_distributed_evaluate:
+    #     print("History (metrics, distributed, evaluate, accuracy):", history.metrics_distributed_evaluate['accuracy'])
+    #     df_dist_eval_acc = pd.DataFrame(history.metrics_distributed_evaluate['accuracy'], columns=['Round', 'Accuracy'])
+    #     df_dist_eval_acc.to_csv('distributed_eval_accuracy.csv', index=False)
+    #     print("Distributed evaluate accuracy saved to distributed_eval_accuracy.csv")
 
     if 'avg_cpu_usage_percent' in history.metrics_distributed:
          print("History (metrics, distributed, evaluate, avg_cpu_usage_percent):", history.metrics_distributed['avg_cpu_usage_percent'])
          df_dist_eval_cpu = pd.DataFrame(history.metrics_distributed['avg_cpu_usage_percent'], columns=['Round', 'Avg_CPU_Usage_Percent'])
          df_dist_eval_cpu.to_csv('distributed_eval_cpu_usage.csv', index=False)
          print("Distributed evaluate CPU usage saved to distributed_eval_cpu_usage.csv")
+
+    if 'avg_gpu_usage_percent' in history.metrics_distributed_fit:
+        print("History (metrics, distributed, fit, avg_gpu_usage_percent):", history.metrics_distributed_fit['avg_gpu_usage_percent'])
+        df_dist_fit_gpu = pd.DataFrame(history.metrics_distributed_fit['avg_gpu_usage_percent'], columns=['Round', 'Avg_GPU_Usage_Percent'])
+        df_dist_fit_gpu.to_csv('distributed_fit_gpu_usage.csv', index=False)
+        print("Distributed fit GPU usage saved to distributed_fit_gpu_usage.csv")
+
     else:
          print("Warning: 'avg_cpu_usage_percent' not found in history.metrics_distributed from evaluation.")
 
