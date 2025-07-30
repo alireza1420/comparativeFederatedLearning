@@ -15,6 +15,8 @@ import time
 import random
 import collections
 from typing import Dict, Tuple, Optional, List, Union # Import all necessary types
+import matplotlib.pyplot as plt
+from sklearn.metrics import precision_score, recall_score, f1_score, classification_report
 
 # For CPU Usage monitoring (client-side, limited scope)
 import psutil
@@ -50,30 +52,32 @@ client_cpu_usage_metrics = collections.defaultdict(list) # Stores {round_num: [c
 class CNN(nn.Module):
     def __init__(self):
         super(CNN, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
+        self.conv1 = nn.Conv2d(1, 32, 3, padding=1)
         self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
         self.pool = nn.MaxPool2d(2, 2)
-        self.fc1 = nn.Linear(64 * 8 * 8, 512)
-        self.fc2 = nn.Linear(512, 10)
+        self.fc1 = nn.Linear(64 * 7 * 7, 512)
+        self.fc2 = nn.Linear(512, 10) # 10 classes for MNIST digits (0-9)
 
     def forward(self, x):
         x = self.pool(F.relu(self.conv1(x)))
         x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(-1, 64 * 8 * 8)
+        x = x.view(-1, 64 * 7 * 7) # Match the input size of fc1
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         return x
+
 
 # -------------------------------
 # Data Partitioning
 # -------------------------------
 transform = transforms.Compose([
     transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    transforms.Normalize((0.1307,), (0.3081,))  
 ])
 
-trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform) # <--- Global testset for server
+
+trainset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+testset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform) # <--- Global testset for server
 
 def partition_dataset(dataset, num_clients):
     partition_size = len(dataset) // num_clients
@@ -113,20 +117,18 @@ class FlowerClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-        #Handels measuring GPU ussage
+
+        # Get GPU handle
         handle = pynvml.nvmlDeviceGetHandleByIndex(0) 
-        util_before = pynvml.nvmlDeviceGetUtilizationRates(handle)
-        gpu_before = util_before.gpu
 
         self.model.train()
         optimizer = optim.SGD(self.model.parameters(), lr=0.01)
-        time.sleep(self.profile['speed'])
+        time.sleep(self.profile['speed'])  # Simulate delay if needed
 
-        # Start CPU usage monitoring
+        # Start CPU usage monitoring (will sample after training)
         process = psutil.Process()
 
-        cpu_before = process.cpu_percent(interval=None) # Non-blocking
-
+        # ---- TRAINING LOOP ----
         for _ in range(EPOCHS):
             for images, labels in self.train_loader:
                 images, labels = images.to(DEVICE), labels.to(DEVICE)
@@ -134,21 +136,19 @@ class FlowerClient(fl.client.NumPyClient):
                 loss = self.criterion(self.model(images), labels)
                 loss.backward()
                 optimizer.step()
-        # Calculates GPU usage After Training
+
+        # Get GPU utilization AFTER training
         util_after = pynvml.nvmlDeviceGetUtilizationRates(handle)
-        gpu_after = util_after.gpu
+        gpu_usage = util_after.gpu  # Percentage
 
-        gpu_diff = abs(gpu_after - gpu_before)
+        # CPU usage after training (sample with interval)
+        cpu_usage = process.cpu_percent(interval=1.0)
 
-
-        # Calculate CPU usage AFTER training
-        cpu_after = process.cpu_percent(interval=None) # Non-blocking
-        cpu_diff = cpu_after - cpu_before if cpu_after >= cpu_before else cpu_before - cpu_after # Simple diff
-
+        # ---- ACCURACY EVALUATION ----
         correct, total = 0, 0
         self.model.eval()
         with torch.no_grad():
-            for images, labels in self.train_loader: # Evaluating on TRAIN loader
+            for images, labels in self.train_loader:
                 images, labels = images.to(DEVICE), labels.to(DEVICE)
                 outputs = self.model(images)
                 _, predicted = torch.max(outputs, 1)
@@ -156,50 +156,52 @@ class FlowerClient(fl.client.NumPyClient):
                 correct += (predicted == labels).sum().item()
         
         accuracy = correct / total if total > 0 else 0.0
-        
-        # Return CPU usage as a metric
-        return self.get_parameters({}), len(self.train_loader.dataset), {"accuracy": accuracy,
-                                                                          "cpu_usage_percent": cpu_diff,
-                                                                          "gpu_usage_percent":gpu_diff}
+
+        return self.get_parameters({}), len(self.train_loader.dataset), {
+            "accuracy": accuracy,
+            "cpu_usage_percent": cpu_usage,
+            "gpu_usage_percent": gpu_usage
+        }
+
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         self.model.eval()
 
-           #Handels measuring GPU ussage
+        # GPU usage before is optional; can ignore
         handle = pynvml.nvmlDeviceGetHandleByIndex(0) 
-        util_before = pynvml.nvmlDeviceGetUtilizationRates(handle)
-        gpu_before = util_before.gpu
-        # Start CPU usage monitoring
+
+        # Start CPU usage monitoring (will re-sample after evaluation)
         process = psutil.Process()
-        cpu_before = process.cpu_percent(interval=None) # Non-blocking
 
         correct, total, loss = 0, 0, 0.0
         with torch.no_grad():
-            for images, labels in self.train_loader: # Evaluating on TRAIN loader
+            for images, labels in self.train_loader:
                 images, labels = images.to(DEVICE), labels.to(DEVICE)
                 outputs = self.model(images)
                 loss += self.criterion(outputs, labels).item()
                 _, predicted = torch.max(outputs, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
-                # Calculates GPU usage After Training
-        util_after = pynvml.nvmlDeviceGetUtilizationRates(handle)
-        gpu_after = util_after.gpu
 
-        gpu_diff = abs(gpu_after - gpu_before)
+        # Sample GPU usage *after* evaluation as a proxy
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        gpu_usage = util.gpu
 
-        # Calculate CPU usage AFTER evaluation
-        cpu_after = process.cpu_percent(interval=None) # Non-blocking
-        cpu_diff = cpu_after - cpu_before if cpu_after >= cpu_before else cpu_before - cpu_after # Simple diff
+        # Get CPU usage with a short sampling interval
+        cpu_usage = process.cpu_percent(interval=1.0)
 
-        avg_loss = loss / total if total > 0 else 0.0 # Calculate average loss
+        avg_loss = loss / total if total > 0 else 0.0
         accuracy = correct / total if total > 0 else 0.0
-        
-        print(" heyyyyyyyyyyyyyyyy this is Gpu:",gpu_diff,"and this is",cpu_diff)
-        # Return CPU & GPU usage as a metric
-        return avg_loss, total, {"accuracy": accuracy, "cpu_usage_percent": cpu_diff,
-                                 "gpu_usage_percent": gpu_diff}
+
+        print("GPU usage (%):", gpu_usage, "CPU usage (%):", cpu_usage)
+
+        return avg_loss, total, {
+            "accuracy": accuracy,
+            "cpu_usage_percent": cpu_usage,
+            "gpu_usage_percent": gpu_usage,
+        }
+
 
 # -------------------------------
 # Client Function
@@ -233,7 +235,7 @@ def fit_metrics_aggregation_fn(results: List[Tuple[fl.common.Parameters, int, Di
         cpu_usages.append(res[1]["cpu_usage_percent"])
             
         gpu_usages.append(res[1]["gpu_usage_percent"])
-        
+
     print("this is acaaaaaacuracies in evaluate metric aggregation",accuracies)
     print("this is cpu_usages in evaluate metric aggregation",cpu_usages)
     print("this is gpu_usages in evaluate metric aggregation",gpu_usages)
@@ -305,6 +307,9 @@ def get_evaluate_fn(model: torch.nn.Module, test_loader: DataLoader, device: tor
 
         correct, total, loss = 0, 0, 0.0
         criterion = nn.CrossEntropyLoss()
+        all_preds = []
+        all_labels = []
+
 
         with torch.no_grad():
             for images, labels in test_loader:
@@ -313,15 +318,29 @@ def get_evaluate_fn(model: torch.nn.Module, test_loader: DataLoader, device: tor
                 loss += criterion(outputs, labels).item()
                 _, predicted = torch.max(outputs, 1)
                 total += labels.size(0)
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+
                 correct += (predicted == labels).sum().item()
         
         avg_loss = loss / len(test_loader.dataset) if len(test_loader.dataset) > 0 else 0.0
         accuracy = correct / total if total > 0 else 0.0
-        
-        print(f"Server-side evaluation: Round {server_round}, Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
-        # Remove CSV writing from here as well, collect from history
-        return avg_loss, {"accuracy": accuracy}
+        precision = precision_score(all_labels, all_preds, average='macro')
+        recall = recall_score(all_labels, all_preds, average='macro')
+        f1 = f1_score(all_labels, all_preds, average='macro')
 
+        print("Precision:", precision)
+        print("Recall:", recall)
+        print("F1 Score:", f1)
+
+
+        print(f"Server-side evaluation: Round {server_round}, Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
+        return avg_loss, {
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1
+}
     return evaluate
 
 
@@ -386,7 +405,7 @@ global_test_loader = DataLoader(testset, batch_size=BATCH_SIZE)
 strategy = TimedFedAvg( # Use your custom strategy here
     fraction_fit=0.5,
     fraction_evaluate=0.5,
-    min_fit_clients=5,
+    min_fit_clients=10,
     min_available_clients=NUM_CLIENTS,
     fit_metrics_aggregation_fn=fit_metrics_aggregation_fn,
     evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
@@ -403,7 +422,7 @@ def main():
     history = fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=3), # Set a reasonable number of rounds for testing
+        config=fl.server.ServerConfig(num_rounds=2), # Set a reasonable number of rounds for testing
         client_resources= CLIENT_RESOURCES, # Use the defined CLIENT_RESOURCES
         strategy=strategy,
     )
@@ -417,12 +436,27 @@ def main():
         df_centralized_acc = pd.DataFrame(history.metrics_centralized['accuracy'], columns=['Round', 'Accuracy'])
         df_centralized_acc.to_csv('centralized_model_accuracy.csv', index=False)
         print("Centralized model accuracy saved to centralized_model_accuracy.csv")
+        
+    global_accuracy_centralised = history.metrics_centralized["accuracy"]
+    round = [data[0] for data in global_accuracy_centralised]
+    acc = [100.0 * data[1] for data in global_accuracy_centralised]
+
+    plt.figure(figsize=(10, 6)) # Optional: Make the plot a bit larger
+    plt.plot(round, acc)
+    plt.grid(True) # Use True for clarity, though grid() works too
+    plt.ylabel("Accuracy (%)")
+    plt.xlabel("Round")
+    plt.title("Centralized Model Accuracy Over Rounds") # Good practice to add a title
+    plt.show() # This line is crucial to display the plot when run as a script
+
+        
 
     # Distributed Losses
     print("History (loss, distributed):", history.losses_distributed)
     df_distributed_loss = pd.DataFrame(history.losses_distributed, columns=['Round', 'Loss'])
     df_distributed_loss.to_csv('distributed_evaluation_loss.csv', index=False)
     print("Distributed evaluation loss saved to distributed_evaluation_loss.csv")
+
 
     # Distributed Fit Metrics (including average CPU usage)
     if 'avg_accuracy' in history.metrics_distributed_fit: # Check for a known key
@@ -446,17 +480,25 @@ def main():
     #     df_dist_eval_acc.to_csv('distributed_eval_accuracy.csv', index=False)
     #     print("Distributed evaluate accuracy saved to distributed_eval_accuracy.csv")
 
+    # if 'avg_gpu_usage_percent' in history.metrics_distributed_evaluate:
+    #     print("History (metrics, distributed, fit, avg_gpu_usage_percent):", history.metrics_distributed_evaluate['avg_gpu_usage_percent'])
+    #     df_dist_fit_gpu = pd.DataFrame(history.metrics_distributed_evaluate['avg_gpu_usage_percent'], columns=['Round', 'Avg_GPU_Usage_Percent'])
+    #     df_dist_fit_gpu.to_csv('distributed_evaluate_gpu_usage.csv', index=False)
+    #     print("Distributed fit GPU usage saved to distributed_evaluate_gpu_usage.csv")
+
     if 'avg_cpu_usage_percent' in history.metrics_distributed:
          print("History (metrics, distributed, evaluate, avg_cpu_usage_percent):", history.metrics_distributed['avg_cpu_usage_percent'])
          df_dist_eval_cpu = pd.DataFrame(history.metrics_distributed['avg_cpu_usage_percent'], columns=['Round', 'Avg_CPU_Usage_Percent'])
-         df_dist_eval_cpu.to_csv('distributed_eval_cpu_usage.csv', index=False)
-         print("Distributed evaluate CPU usage saved to distributed_eval_cpu_usage.csv")
+         df_dist_eval_cpu.to_csv('distributed_evaluation_cpu_usage.csv', index=False)
+         print("Distributed evaluate CPU usage saved to distributed_evaluation_cpu_usage.csv")
 
     if 'avg_gpu_usage_percent' in history.metrics_distributed_fit:
         print("History (metrics, distributed, fit, avg_gpu_usage_percent):", history.metrics_distributed_fit['avg_gpu_usage_percent'])
         df_dist_fit_gpu = pd.DataFrame(history.metrics_distributed_fit['avg_gpu_usage_percent'], columns=['Round', 'Avg_GPU_Usage_Percent'])
         df_dist_fit_gpu.to_csv('distributed_fit_gpu_usage.csv', index=False)
         print("Distributed fit GPU usage saved to distributed_fit_gpu_usage.csv")
+
+       
 
     else:
          print("Warning: 'avg_cpu_usage_percent' not found in history.metrics_distributed from evaluation.")
