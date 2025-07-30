@@ -24,7 +24,7 @@ import psutil
 # -------------------------------
 # Configuration
 # -------------------------------
-NUM_CLIENTS = 10
+NUM_CLIENTS = 100
 BATCH_SIZE = 32
 EPOCHS = 5 # Increased epochs for better learning
 DEVICE = torch.device("cuda")
@@ -422,7 +422,7 @@ def main():
     history = fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=2), # Set a reasonable number of rounds for testing
+        config=fl.server.ServerConfig(num_rounds=10), # Set a reasonable number of rounds for testing
         client_resources= CLIENT_RESOURCES, # Use the defined CLIENT_RESOURCES
         strategy=strategy,
     )
@@ -436,7 +436,31 @@ def main():
         df_centralized_acc = pd.DataFrame(history.metrics_centralized['accuracy'], columns=['Round', 'Accuracy'])
         df_centralized_acc.to_csv('centralized_model_accuracy.csv', index=False)
         print("Centralized model accuracy saved to centralized_model_accuracy.csv")
+
+    print("History (precision, centralized):", history.losses_centralized)
+    if "precision" in history.metrics_centralized:
+        print("History (metrics, centralized, precision):", history.metrics_centralized['precision'])
+        df_centralized_precision=pd.DataFrame(history.metrics_centralized['precision'])
+        df_centralized_precision.to_csv('centralized_model_precision.csv', index=False)
+        print("Centralized model precision saved to centralized_model_precision.csv")
         
+    print("History (f1, centralized):", history.losses_centralized)
+    if "f1" in history.metrics_centralized:
+        print("History (metrics, centralized, f1):", history.metrics_centralized['f1'])
+        df_centralized_f1=pd.DataFrame(history.metrics_centralized['f1'])
+        df_centralized_f1.to_csv('centralized_model_f1.csv', index=False)
+        print("Centralized model precision saved to centralized_model_f1.csv")
+
+    print("History (f1, recall):", history.losses_centralized)
+    if "recall" in history.metrics_centralized:
+        print("History (metrics, centralized, recall):", history.metrics_centralized['recall'])
+        df_centralized_recall=pd.DataFrame(history.metrics_centralized['recall'])
+        df_centralized_recall.to_csv('centralized_model_recall.csv', index=False)
+        print("Centralized model precision saved to centralized_model_recall.csv")   
+
+    
+            
+
     global_accuracy_centralised = history.metrics_centralized["accuracy"]
     round = [data[0] for data in global_accuracy_centralised]
     acc = [100.0 * data[1] for data in global_accuracy_centralised]
@@ -471,20 +495,6 @@ def main():
         df_dist_fit_cpu.to_csv('distributed_fit_cpu_usage.csv', index=False)
         print("Distributed fit CPU usage saved to distributed_fit_cpu_usage.csv")
 
-
-    # # Distributed Evaluate Metrics (including average CPU usage)
-    # # The `evaluate_metrics_aggregation_fn` aggregates metrics reported by clients during their `evaluate` call.
-    # if 'accuracy' in history.metrics_distributed_evaluate:
-    #     print("History (metrics, distributed, evaluate, accuracy):", history.metrics_distributed_evaluate['accuracy'])
-    #     df_dist_eval_acc = pd.DataFrame(history.metrics_distributed_evaluate['accuracy'], columns=['Round', 'Accuracy'])
-    #     df_dist_eval_acc.to_csv('distributed_eval_accuracy.csv', index=False)
-    #     print("Distributed evaluate accuracy saved to distributed_eval_accuracy.csv")
-
-    # if 'avg_gpu_usage_percent' in history.metrics_distributed_evaluate:
-    #     print("History (metrics, distributed, fit, avg_gpu_usage_percent):", history.metrics_distributed_evaluate['avg_gpu_usage_percent'])
-    #     df_dist_fit_gpu = pd.DataFrame(history.metrics_distributed_evaluate['avg_gpu_usage_percent'], columns=['Round', 'Avg_GPU_Usage_Percent'])
-    #     df_dist_fit_gpu.to_csv('distributed_evaluate_gpu_usage.csv', index=False)
-    #     print("Distributed fit GPU usage saved to distributed_evaluate_gpu_usage.csv")
 
     if 'avg_cpu_usage_percent' in history.metrics_distributed:
          print("History (metrics, distributed, evaluate, avg_cpu_usage_percent):", history.metrics_distributed['avg_cpu_usage_percent'])
