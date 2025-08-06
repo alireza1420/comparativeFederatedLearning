@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import precision_score, recall_score, f1_score, classification_report
 # For CPU Usage monitoring (client-side, limited scope)
 import psutil
+from flwr.common import Scalar
 
 # -------------------------------
 # Configuration
@@ -34,7 +35,7 @@ DEVICE = torch.device("cuda")
 # Adjust based on your system's capabilities
 # For GPU, 1.0 means one client gets full GPU, 0.0 means CPU only.
 # Fractional (e.g., 0.25) can be used for scheduling but doesn't mean true concurrent sharing on one GPU.
-CLIENT_RESOURCES = {"num_cpus": 5, "num_gpus": 1.0} # Start with 0.0 GPU if unsure
+CLIENT_RESOURCES = {"num_cpus": 1, "num_gpus": 0.1} # Start with 0.0 GPU if unsure
 
 
 CLIENT_PROFILES = [
@@ -83,13 +84,10 @@ testset = torchvision.datasets.MNIST(root='./data', train=False, download=True, 
 
 
 def partition_dataset(dataset, num_clients):
-    partition_size = len(dataset) // num_clients
-    # Ensure all data is distributed, handle remainder
-    indices_per_client = [list(range(i * partition_size, (i + 1) * partition_size)) for i in range(num_clients)]
-    # Distribute any remaining samples to the last client
-    if len(dataset) % num_clients != 0:
-        indices_per_client[-1].extend(range(NUM_CLIENTS * partition_size, len(dataset)))
-    return indices_per_client
+    all_indices=list(range(len(dataset)))
+    np.random.shuffle(all_indices)
+    client_indices = np.array_split(all_indices, num_clients)
+    return [arr.tolist() for arr in client_indices]
 
 train_partitions = partition_dataset(trainset, NUM_CLIENTS)
 
@@ -133,12 +131,6 @@ class FlowerClient(fl.client.NumPyClient):
         time.sleep(self.profile['speed'])
         process = psutil.Process()
 
-        # Save global weights for FedProx
-        global_weights = [p.clone().detach().to(DEVICE) for p in self.model.parameters()]
-
-        # FedProx dynamic mu based on latency
-        base_mu = 0.001
-        mu = base_mu * self.profile["latency"]
 
         for _ in range(EPOCHS):
             for images, labels in self.train_loader:
@@ -146,12 +138,6 @@ class FlowerClient(fl.client.NumPyClient):
                 optimizer.zero_grad()
                 outputs = self.model(images)
                 loss = self.criterion(outputs, labels)
-
-                # FedProx proximal term
-                prox_term = 0.0
-                for w, w_t in zip(self.model.parameters(), global_weights):
-                    prox_term += torch.norm(w - w_t) ** 2
-                loss += (mu / 2) * prox_term
 
                 loss.backward()
                 optimizer.step()
@@ -236,77 +222,28 @@ def client_fn(cid: str) -> fl.client.Client:
 # -------------------------------
 # Metric Aggregation Functions
 # -------------------------------
-def fit_metrics_aggregation_fn(results: List[Tuple[fl.common.Parameters, int, Dict[str, fl.common.Scalar]]]):
-    accuracies = []
-    cpu_usages = []
-    gpu_usages = []
-    print("we need to debug this fffffffffiiiiiiiiitttttttt",results)
+def weighted_average_aggregator(
+    results: List[Tuple[int, Dict[str, Scalar]]]
+) -> Dict[str, Scalar]:
+    """
+    This correctly computes the weighted average of all metrics.
+    """
+    if not results:
+        return {}
 
-    for res in results:
-        print(res[1]["accuracy"])
-           
-        accuracies.append(res[1]["accuracy"])
-            
-        cpu_usages.append(res[1]["cpu_usage_percent"])
-            
-        gpu_usages.append(res[1]["gpu_usage_percent"])
+    # Correctly unpack the 2-element tuples
+    num_examples_list = [num_examples for num_examples, metrics in results]
+    metrics_list = [metrics for num_examples, metrics in results]
 
-    print("this is acaaaaaacuracies in evaluate metric aggregation",accuracies)
-    print("this is cpu_usages in evaluate metric aggregation",cpu_usages)
-    print("this is gpu_usages in evaluate metric aggregation",gpu_usages)
-    
+    # The rest of your logic was correct
     aggregated_metrics = {}
-    if accuracies:
-        aggregated_metrics["avg_accuracy"] = float(np.mean(accuracies))
-    else:
-        aggregated_metrics["avg_accuracy"] = 0.0 # Still debug this to get non-zero
-        
-    if cpu_usages:
-        aggregated_metrics["avg_cpu_usage_percent"] = float(np.mean(cpu_usages))
-    else:
-        aggregated_metrics["avg_cpu_usage_percent"] = 0.0
-    if gpu_usages:
-        aggregated_metrics["avg_gpu_usage_percent"] = float(np.mean(gpu_usages))
-    else:
-        aggregated_metrics["avg_gpu_usage_percent"] = 1.55
+    # Iterate over all metric keys (e.g., "accuracy")
+    for key in metrics_list[0].keys():
+        values = [metrics[key] for metrics in metrics_list]
+        weighted_avg = np.average(values, weights=num_examples_list)
+        aggregated_metrics[f"avg_{key}"] = float(weighted_avg)
 
     return aggregated_metrics
-
-def evaluate_metrics_aggregation_fn(results: List[Tuple[float, int, Dict[str, fl.common.Scalar]]]):
-    accuracies = []
-    cpu_usages = []
-    gpu_usages = []
-    print("evaluateeeeeeeeeeee")
-    for res in results:
-        print(res[1]["accuracy"])
-           
-        accuracies.append(res[1]["accuracy"])
-            
-        cpu_usages.append(res[1]["cpu_usage_percent"])
-            
-        gpu_usages.append(res[1]["gpu_usage_percent"])
-    print("this is acaaaaaacuracies in evaluate metric aggregation",accuracies)
-    print("this is cpu_usages in evaluate metric aggregation",cpu_usages)
-    print("this is gpu_usages in evaluate metric aggregation",gpu_usages)
-    
-    aggregated_metrics = {}
-    if accuracies:
-        aggregated_metrics["accuracy"] = float(np.mean(accuracies))
-    else:
-        aggregated_metrics["accuracy"] = 0.0
-        
-    if cpu_usages:
-        aggregated_metrics["avg_cpu_usage_percent"] = float(np.mean(cpu_usages))
-    else:
-        aggregated_metrics["avg_cpu_usage_percent"] = 0.0
-    if gpu_usages:
-        aggregated_metrics["avg_gpu_usage_percent"] = float(np.mean(gpu_usages))
-    else:
-        aggregated_metrics["avg_gpu_usage_percent"] = 1.55
-    
-
-    return aggregated_metrics
-
 # -------------------------------
 # Centralized Evaluation Function for Server
 # -------------------------------
@@ -392,24 +329,6 @@ class TimedFedAvg(fl.server.strategy.FedAvg):
         
         return aggregated_parameters, aggregated_metrics
 
-    # If you also need to time evaluation rounds separately (not just fit rounds that include eval)
-    # def configure_evaluate(
-    #     self, server_round: int, parameters: fl.common.Parameters, client_manager: fl.server.client_manager.ClientManager
-    # ) -> List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateIns]]:
-    #     # Not typically needed if evaluation is part of the fit cycle or server-side
-    #     return super().configure_evaluate(server_round, parameters, client_manager)
-
-    # def aggregate_evaluate(
-    #     self,
-    #     server_round: int,
-    #     results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes]],
-    #     failures: List[Union[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes], BaseException]],
-    # ) -> Tuple[Optional[float], Dict[str, fl.common.Scalar]]:
-    #     # Only if clients perform dedicated evaluation rounds and report metrics
-    #     loss_aggregated, metrics_aggregated = super().aggregate_evaluate(server_round, results, failures)
-    #     # Add timing logic here if needed for pure evaluate rounds
-    #     return loss_aggregated, metrics_aggregated
-
 
 # -------------------------------
 # Strategy Instantiation
@@ -422,8 +341,8 @@ strategy = TimedFedAvg( # Use your custom strategy here
     fraction_evaluate=0.5,
     min_fit_clients=10,
     min_available_clients=NUM_CLIENTS,
-    fit_metrics_aggregation_fn=fit_metrics_aggregation_fn,
-    evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
+    fit_metrics_aggregation_fn=weighted_average_aggregator,
+    evaluate_metrics_aggregation_fn=weighted_average_aggregator,
     evaluate_fn=get_evaluate_fn(global_model, global_test_loader, DEVICE),
     initial_parameters=fl.common.ndarrays_to_parameters(
         [val.cpu().numpy() for val in global_model.state_dict().values()]
@@ -439,7 +358,7 @@ def main():
     history = fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=10), # Set a reasonable number of rounds for testing
+        config=fl.server.ServerConfig(num_rounds=5), # Set a reasonable number of rounds for testing
         client_resources= CLIENT_RESOURCES, # Use the defined CLIENT_RESOURCES
         strategy=strategy,
     )
@@ -510,19 +429,6 @@ def main():
         print("Distributed fit CPU usage saved to distributed_fit_cpu_usage.csv")
 
 
-    # # Distributed Evaluate Metrics (including average CPU usage)
-    # # The `evaluate_metrics_aggregation_fn` aggregates metrics reported by clients during their `evaluate` call.
-    # if 'accuracy' in history.metrics_distributed_evaluate:
-    #     print("History (metrics, distributed, evaluate, accuracy):", history.metrics_distributed_evaluate['accuracy'])
-    #     df_dist_eval_acc = pd.DataFrame(history.metrics_distributed_evaluate['accuracy'], columns=['Round', 'Accuracy'])
-    #     df_dist_eval_acc.to_csv('distributed_eval_accuracy.csv', index=False)
-    #     print("Distributed evaluate accuracy saved to distributed_eval_accuracy.csv")
-
-    # if 'avg_gpu_usage_percent' in history.metrics_distributed_evaluate:
-    #     print("History (metrics, distributed, fit, avg_gpu_usage_percent):", history.metrics_distributed_evaluate['avg_gpu_usage_percent'])
-    #     df_dist_fit_gpu = pd.DataFrame(history.metrics_distributed_evaluate['avg_gpu_usage_percent'], columns=['Round', 'Avg_GPU_Usage_Percent'])
-    #     df_dist_fit_gpu.to_csv('distributed_evaluate_gpu_usage.csv', index=False)
-    #     print("Distributed fit GPU usage saved to distributed_evaluate_gpu_usage.csv")
 
     if 'avg_cpu_usage_percent' in history.metrics_distributed:
          print("History (metrics, distributed, evaluate, avg_cpu_usage_percent):", history.metrics_distributed['avg_cpu_usage_percent'])
