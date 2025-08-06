@@ -4,6 +4,8 @@ import pandas as pd
 import numpy as np
 import csv
 import torch
+from collections import defaultdict
+import random
 import pynvml
 import torchvision
 import torchvision.transforms as transforms
@@ -17,13 +19,9 @@ import collections
 from typing import Dict, Tuple, Optional, List, Union # Import all necessary types
 import matplotlib.pyplot as plt
 from sklearn.metrics import precision_score, recall_score, f1_score, classification_report
-
 # For CPU Usage monitoring (client-side, limited scope)
 import psutil
-from typing import Callable, Optional
-from flwr.common import FitIns, MetricsAggregationFn, NDArrays, Parameters, Scalar
-from flwr.server.client_manager import ClientManager
-from flwr.server.client_proxy import ClientProxy
+
 # -------------------------------
 # Configuration
 # -------------------------------
@@ -36,7 +34,7 @@ DEVICE = torch.device("cuda")
 # Adjust based on your system's capabilities
 # For GPU, 1.0 means one client gets full GPU, 0.0 means CPU only.
 # Fractional (e.g., 0.25) can be used for scheduling but doesn't mean true concurrent sharing on one GPU.
-CLIENT_RESOURCES = {"num_cpus": 2, "num_gpus": 1.0} # Start with 0.0 GPU if unsure
+CLIENT_RESOURCES = {"num_cpus": 5, "num_gpus": 1.0} # Start with 0.0 GPU if unsure
 
 
 CLIENT_PROFILES = [
@@ -82,6 +80,8 @@ transform = transforms.Compose([
 trainset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
 testset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform) # <--- Global testset for server
 
+
+
 def partition_dataset(dataset, num_clients):
     partition_size = len(dataset) // num_clients
     # Ensure all data is distributed, handle remainder
@@ -92,6 +92,7 @@ def partition_dataset(dataset, num_clients):
     return indices_per_client
 
 train_partitions = partition_dataset(trainset, NUM_CLIENTS)
+
 
 # -------------------------------
 # Flower Client
@@ -176,6 +177,7 @@ class FlowerClient(fl.client.NumPyClient):
             "cpu_usage_percent": cpu_usage,
             "gpu_usage_percent": gpu_usage
         }
+
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
@@ -360,78 +362,35 @@ def get_evaluate_fn(model: torch.nn.Module, test_loader: DataLoader, device: tor
 # -------------------------------
 # Custom Strategy for Round Timing
 # -------------------------------
-class FedProx(fl.server.strategy.FedAvg):
-    
-    # pylint: disable=too-many-arguments,too-many-instance-attributes
-    def __init__(
-        self,
-        *,
-        fraction_fit: float = 1.0,
-        fraction_evaluate: float = 1.0,
-        min_fit_clients: int = 2,
-        min_evaluate_clients: int = 2,
-        min_available_clients: int = 2,
-        evaluate_fn: Optional[
-            Callable[
-                [int, NDArrays, dict[str, Scalar]],
-                Optional[tuple[float, dict[str, Scalar]]],
-            ]
-        ] = None,
-        on_fit_config_fn: Optional[Callable[[int], dict[str, Scalar]]] = None,
-        on_evaluate_config_fn: Optional[Callable[[int], dict[str, Scalar]]] = None,
-        accept_failures: bool = True,
-        initial_parameters: Optional[Parameters] = None,
-        fit_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
-        evaluate_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
-        proximal_mu: float,
-    ) -> None:
-        super().__init__(
-            fraction_fit=fraction_fit,
-            fraction_evaluate=fraction_evaluate,
-            min_fit_clients=min_fit_clients,
-            min_evaluate_clients=min_evaluate_clients,
-            min_available_clients=min_available_clients,
-            evaluate_fn=evaluate_fn,
-            on_fit_config_fn=on_fit_config_fn,
-            on_evaluate_config_fn=on_evaluate_config_fn,
-            accept_failures=accept_failures,
-            initial_parameters=initial_parameters,
-            fit_metrics_aggregation_fn=fit_metrics_aggregation_fn,
-            evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
-        )
-        self.proximal_mu = proximal_mu
-
-    def __repr__(self) -> str:
-        """Compute a string representation of the strategy."""
-        rep = f"FedProx(accept_failures={self.accept_failures})"
-        return rep
-
-
+class TimedFedAvg(fl.server.strategy.FedAvg):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.current_round = 0
 
     def configure_fit(
-        self, server_round: int, parameters: Parameters, client_manager: ClientManager
-    ) -> list[tuple[ClientProxy, FitIns]]:
-        """Configure the next round of training.
+        self, server_round: int, parameters: fl.common.Parameters, client_manager: fl.server.client_manager.ClientManager
+    ) -> List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitIns]]:
+        self.current_round = server_round
+        round_times_data[self.current_round]["start"] = time.time()
+        print(f"Server Round {self.current_round} started at {round_times_data[self.current_round]['start']:.2f}s")
+        return super().configure_fit(server_round, parameters, client_manager)
 
-        Sends the proximal factor mu to the clients
-        """
-        # Get the standard client/config pairs from the FedAvg super-class
-        client_config_pairs = super().configure_fit(
-            server_round, parameters, client_manager
-        )
-
-        # Return client/config pairs with the proximal factor mu added
-        return [
-            (
-                client,
-                FitIns(
-                    fit_ins.parameters,
-                    {**fit_ins.config, "proximal_mu": self.proximal_mu},
-                ),
-            )
-            for client, fit_ins in client_config_pairs
-        ]
-
+    def aggregate_fit(
+        self,
+        server_round: int,
+        results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
+        failures: List[Union[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes], BaseException]],
+    ) -> Tuple[Optional[fl.common.Parameters], Dict[str, fl.common.Scalar]]:
+        aggregated_parameters, aggregated_metrics = super().aggregate_fit(server_round, results, failures)
+        
+        if aggregated_parameters is not None:
+            round_times_data[server_round]["end"] = time.time()
+            duration = round_times_data[server_round]["end"] - round_times_data[server_round]["start"]
+            print(f"Server Round {server_round} completed in {duration:.2f} seconds.")
+            # Add duration to metrics if you want it in the History object
+            aggregated_metrics["round_duration_s"] = duration
+        
+        return aggregated_parameters, aggregated_metrics
 
     # If you also need to time evaluation rounds separately (not just fit rounds that include eval)
     # def configure_evaluate(
@@ -458,11 +417,10 @@ class FedProx(fl.server.strategy.FedAvg):
 global_model = CNN().to(DEVICE)
 global_test_loader = DataLoader(testset, batch_size=BATCH_SIZE)
 
-strategy = FedProx( # Use your custom strategy here
+strategy = TimedFedAvg( # Use your custom strategy here
     fraction_fit=0.5,
     fraction_evaluate=0.5,
     min_fit_clients=10,
-    proximal_mu=0.01,
     min_available_clients=NUM_CLIENTS,
     fit_metrics_aggregation_fn=fit_metrics_aggregation_fn,
     evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
@@ -516,10 +474,7 @@ def main():
         df_centralized_recall=pd.DataFrame(history.metrics_centralized['recall'])
         df_centralized_recall.to_csv('centralized_model_recall.csv', index=False)
         print("Centralized model precision saved to centralized_model_recall.csv")   
-
-    
-            
-
+        
     global_accuracy_centralised = history.metrics_centralized["accuracy"]
     round = [data[0] for data in global_accuracy_centralised]
     acc = [100.0 * data[1] for data in global_accuracy_centralised]
@@ -554,6 +509,20 @@ def main():
         df_dist_fit_cpu.to_csv('distributed_fit_cpu_usage.csv', index=False)
         print("Distributed fit CPU usage saved to distributed_fit_cpu_usage.csv")
 
+
+    # # Distributed Evaluate Metrics (including average CPU usage)
+    # # The `evaluate_metrics_aggregation_fn` aggregates metrics reported by clients during their `evaluate` call.
+    # if 'accuracy' in history.metrics_distributed_evaluate:
+    #     print("History (metrics, distributed, evaluate, accuracy):", history.metrics_distributed_evaluate['accuracy'])
+    #     df_dist_eval_acc = pd.DataFrame(history.metrics_distributed_evaluate['accuracy'], columns=['Round', 'Accuracy'])
+    #     df_dist_eval_acc.to_csv('distributed_eval_accuracy.csv', index=False)
+    #     print("Distributed evaluate accuracy saved to distributed_eval_accuracy.csv")
+
+    # if 'avg_gpu_usage_percent' in history.metrics_distributed_evaluate:
+    #     print("History (metrics, distributed, fit, avg_gpu_usage_percent):", history.metrics_distributed_evaluate['avg_gpu_usage_percent'])
+    #     df_dist_fit_gpu = pd.DataFrame(history.metrics_distributed_evaluate['avg_gpu_usage_percent'], columns=['Round', 'Avg_GPU_Usage_Percent'])
+    #     df_dist_fit_gpu.to_csv('distributed_evaluate_gpu_usage.csv', index=False)
+    #     print("Distributed fit GPU usage saved to distributed_evaluate_gpu_usage.csv")
 
     if 'avg_cpu_usage_percent' in history.metrics_distributed:
          print("History (metrics, distributed, evaluate, avg_cpu_usage_percent):", history.metrics_distributed['avg_cpu_usage_percent'])
