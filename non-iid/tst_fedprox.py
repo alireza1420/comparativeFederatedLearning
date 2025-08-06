@@ -21,21 +21,10 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import precision_score, recall_score, f1_score, classification_report
 # For CPU Usage monitoring (client-side, limited scope)
 import psutil
-from typing import Callable, Optional, Union
-
-import numpy as np
-
-from flwr.common import (
-    FitRes,
-    MetricsAggregationFn,
-    NDArrays,
-    Parameters,
-    Scalar,
-    ndarrays_to_parameters,
-    parameters_to_ndarrays,
-)
+from typing import Callable, Optional
+from flwr.common import FitIns, MetricsAggregationFn, NDArrays, Parameters, Scalar
+from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
-
 
 
 # -------------------------------
@@ -138,7 +127,7 @@ class FlowerClient(fl.client.NumPyClient):
         try:
             pynvml.nvmlInit()
         except pynvml.NVMLError_AlreadyInitialized:
-            pass
+            pass  # Safe to ignore
         except pynvml.NVMLError as e:
             print(f"NVML init failed: {e}")
 
@@ -152,7 +141,7 @@ class FlowerClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-        straggler_rate = random.uniform(0.1, 0.9)
+        straggler_rate=random.uniform(0.1, 0.9)
         print(f"we should see straggler rate at {straggler_rate}")
         if random.random() < straggler_rate:
             print(f"client{self.cid} is a straggler this round.")
@@ -164,6 +153,12 @@ class FlowerClient(fl.client.NumPyClient):
         time.sleep(self.profile['speed'])
         process = psutil.Process()
 
+        # Save global weights for FedProx
+        global_weights = [p.clone().detach().to(DEVICE) for p in self.model.parameters()]
+
+        # FedProx dynamic mu based on latency
+        base_mu = 0.001
+        mu = base_mu * self.profile["latency"]
 
         for _ in range(EPOCHS):
             for images, labels in self.train_loader:
@@ -171,7 +166,6 @@ class FlowerClient(fl.client.NumPyClient):
                 optimizer.zero_grad()
                 outputs = self.model(images)
                 loss = self.criterion(outputs, labels)
-
                 loss.backward()
                 optimizer.step()
 
@@ -197,6 +191,44 @@ class FlowerClient(fl.client.NumPyClient):
             "gpu_usage_percent": gpu_usage
         }
 
+
+    def evaluate(self, parameters, config):
+        self.set_parameters(parameters)
+        self.model.eval()
+
+        # GPU usage before is optional; can ignore
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0) 
+
+        # Start CPU usage monitoring (will re-sample after evaluation)
+        process = psutil.Process()
+
+        correct, total, loss = 0, 0, 0.0
+        with torch.no_grad():
+            for images, labels in self.train_loader:
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+                outputs = self.model(images)
+                loss += self.criterion(outputs, labels).item()
+                _, predicted = torch.max(outputs, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        # Sample GPU usage *after* evaluation as a proxy
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        gpu_usage = util.gpu
+
+        # Get CPU usage with a short sampling interval
+        cpu_usage = process.cpu_percent(interval=1.0)
+
+        avg_loss = loss / total if total > 0 else 0.0
+        accuracy = correct / total if total > 0 else 0.0
+
+        print("GPU usage (%):", gpu_usage, "CPU usage (%):", cpu_usage)
+
+        return avg_loss, total, {
+            "accuracy": accuracy,
+            "cpu_usage_percent": cpu_usage,
+            "gpu_usage_percent": gpu_usage,
+        }
 
 
 # -------------------------------
@@ -341,21 +373,19 @@ def get_evaluate_fn(model: torch.nn.Module, test_loader: DataLoader, device: tor
 
 
 # -------------------------------
-# FedAdam
+# Custom Strategy for Round Timing
 # -------------------------------
-class FedAdam(fl.server.strategy.FedOpt):
-    """FedAdam - Adaptive Federated Optimization using Adam.   """
-
-    # pylint: disable=too-many-arguments,too-many-instance-attributes,too-many-locals
+class FedProx(fl.server.strategy.FedAvg):
+    
+    # pylint: disable=too-many-arguments,too-many-instance-attributes
     def __init__(
         self,
-        *,        
+        *,
         fraction_fit: float = 1.0,
         fraction_evaluate: float = 1.0,
         min_fit_clients: int = 2,
         min_evaluate_clients: int = 2,
         min_available_clients: int = 2,
-
         evaluate_fn: Optional[
             Callable[
                 [int, NDArrays, dict[str, Scalar]],
@@ -365,14 +395,10 @@ class FedAdam(fl.server.strategy.FedOpt):
         on_fit_config_fn: Optional[Callable[[int], dict[str, Scalar]]] = None,
         on_evaluate_config_fn: Optional[Callable[[int], dict[str, Scalar]]] = None,
         accept_failures: bool = True,
-        initial_parameters: Parameters,
+        initial_parameters: Optional[Parameters] = None,
         fit_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
         evaluate_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
-        eta: float = 1e-1,
-        eta_l: float = 1e-1,
-        beta_1: float = 0.9,
-        beta_2: float = 0.99,
-        tau: float = 1e-9,
+        proximal_mu: float,
     ) -> None:
         super().__init__(
             fraction_fit=fraction_fit,
@@ -387,83 +413,58 @@ class FedAdam(fl.server.strategy.FedOpt):
             initial_parameters=initial_parameters,
             fit_metrics_aggregation_fn=fit_metrics_aggregation_fn,
             evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
-            eta=eta,
-            eta_l=eta_l,
-            beta_1=beta_1,
-            beta_2=beta_2,
-            tau=tau,
         )
+        self.proximal_mu = proximal_mu
 
     def __repr__(self) -> str:
         """Compute a string representation of the strategy."""
-        rep = f"FedAdam(accept_failures={self.accept_failures})"
+        rep = f"FedProx(accept_failures={self.accept_failures})"
         return rep
 
 
 
-def aggregate_fit(
-    self,
-    server_round: int,
-    results: list[tuple[ClientProxy, FitRes]],
-    failures: list[Union[tuple[ClientProxy, FitRes], BaseException]],
-) -> tuple[Optional[Parameters], dict[str, Scalar]]:
-    """Aggregate fit results using FedAdam."""
-    # This part remains the same
-    if not results:
-        return None, {}
-    
-    # This call to super().aggregate_fit() will return the FedAvg aggregated model
-    # which is what we need to compute the pseudo-gradient.
-    aggregated_params, metrics_aggregated = super().aggregate_fit(
-        server_round=server_round, results=results, failures=failures
-    )
-    if aggregated_params is None:
-        return None, {}
+    def configure_fit(
+        self, server_round: int, parameters: Parameters, client_manager: ClientManager
+    ) -> list[tuple[ClientProxy, FitIns]]:
+        """Configure the next round of training.
 
-    aggregated_weights = parameters_to_ndarrays(aggregated_params)
+        Sends the proximal factor mu to the clients
+        """
+        # Get the standard client/config pairs from the FedAvg super-class
+        client_config_pairs = super().configure_fit(
+            server_round, parameters, client_manager
+        )
 
-    # Calculate pseudo-gradient
-    # Note: current_weights are the weights from the previous round
-    delta_t = [
-        x - y for x, y in zip(aggregated_weights, self.current_weights)
-    ]
-    
-    # Adam moment updates (your implementation was correct)
-    # m_t
-    if not self.m_t:
-        self.m_t = [np.zeros_like(x) for x in delta_t]
-    self.m_t = [
-        np.multiply(self.beta_1, m) + (1 - self.beta_1) * d
-        for m, d in zip(self.m_t, delta_t)
-    ]
-
-    # v_t
-    if not self.v_t:
-        self.v_t = [np.zeros_like(x) for x in delta_t]
-    self.v_t = [
-        np.multiply(self.beta_2, v) + (1 - self.beta_2) * np.multiply(d, d)
-        for v, d in zip(self.v_t, delta_t)
-    ]
+        # Return client/config pairs with the proximal factor mu added
+        return [
+            (
+                client,
+                FitIns(
+                    fit_ins.parameters,
+                    {**fit_ins.config, "proximal_mu": self.proximal_mu},
+                ),
+            )
+            for client, fit_ins in client_config_pairs
+        ]
 
 
-    t = server_round 
-    m_hat = [
-        m / (1.0 - self.beta_1**t) for m in self.m_t
-    ]
-    v_hat = [
-        v / (1.0 - self.beta_2**t) for v in self.v_t
-    ]
+    # If you also need to time evaluation rounds separately (not just fit rounds that include eval)
+    # def configure_evaluate(
+    #     self, server_round: int, parameters: fl.common.Parameters, client_manager: fl.server.client_manager.ClientManager
+    # ) -> List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateIns]]:
+    #     # Not typically needed if evaluation is part of the fit cycle or server-side
+    #     return super().configure_evaluate(server_round, parameters, client_manager)
 
-    # Server-side update
-    new_weights = [
-        w + self.eta * m / (np.sqrt(v) + self.tau)
-        for w, m, v in zip(self.current_weights, m_hat, v_hat)
-    ]
-
-    self.current_weights = new_weights
-    return ndarrays_to_parameters(self.current_weights), metrics_aggregated
-
-  
+    # def aggregate_evaluate(
+    #     self,
+    #     server_round: int,
+    #     results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes]],
+    #     failures: List[Union[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes], BaseException]],
+    # ) -> Tuple[Optional[float], Dict[str, fl.common.Scalar]]:
+    #     # Only if clients perform dedicated evaluation rounds and report metrics
+    #     loss_aggregated, metrics_aggregated = super().aggregate_evaluate(server_round, results, failures)
+    #     # Add timing logic here if needed for pure evaluate rounds
+    #     return loss_aggregated, metrics_aggregated
 
 
 # -------------------------------
@@ -472,15 +473,11 @@ def aggregate_fit(
 global_model = CNN().to(DEVICE)
 global_test_loader = DataLoader(testset, batch_size=BATCH_SIZE)
 
-strategy = FedAdam( 
-    eta=0.001,  # A much smaller server-side learning rate
-    eta_l=0.01, # This is the client-side learning rate FedAdam suggests, but it's often better to set this in your client code
-    beta_1=0.9,
-    beta_2=0.99,
-    tau=1e-9,
+strategy = FedProx( # Use your custom strategy here
     fraction_fit=0.5,
     fraction_evaluate=0.5,
     min_fit_clients=10,
+    proximal_mu=0.01,
     min_available_clients=NUM_CLIENTS,
     fit_metrics_aggregation_fn=fit_metrics_aggregation_fn,
     evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
@@ -499,7 +496,7 @@ def main():
     history = fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=10), # Set a reasonable number of rounds for testing
+        config=fl.server.ServerConfig(num_rounds=2), # Set a reasonable number of rounds for testing
         client_resources= CLIENT_RESOURCES, # Use the defined CLIENT_RESOURCES
         strategy=strategy,
     )
