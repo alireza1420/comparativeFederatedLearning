@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import precision_score, recall_score, f1_score, classification_report
 # For CPU Usage monitoring (client-side, limited scope)
 import psutil
+from flwr.common import Scalar
 
 # -------------------------------
 # Configuration
@@ -34,7 +35,7 @@ DEVICE = torch.device("cuda")
 # Adjust based on your system's capabilities
 # For GPU, 1.0 means one client gets full GPU, 0.0 means CPU only.
 # Fractional (e.g., 0.25) can be used for scheduling but doesn't mean true concurrent sharing on one GPU.
-CLIENT_RESOURCES = {"num_cpus": 5, "num_gpus": 1.0} # Start with 0.0 GPU if unsure
+CLIENT_RESOURCES = {"num_cpus": 1, "num_gpus": 0.1} # Start with 0.0 GPU if unsure
 
 
 CLIENT_PROFILES = [
@@ -83,26 +84,56 @@ testset = torchvision.datasets.MNIST(root='./data', train=False, download=True, 
 
 
 def partition_dataset_noniid(dataset, num_clients, num_classes_per_client=2):
-    label_to_indices = defaultdict(list)
 
-    # Group all indices by label
+    num_classes = len(dataset.classes)
+    
+    # 1. Group all indices by their class label
+    label_to_indices = defaultdict(list)
     for idx, (_, label) in enumerate(dataset):
         label_to_indices[label].append(idx)
 
-    # Shuffle the indices per label for randomness
-    for label in label_to_indices:
-        random.shuffle(label_to_indices[label])
+    class_assignments = []
+    assignments_per_class = (num_clients * num_classes_per_client) // num_classes
+    for label in range(num_classes):
+        class_assignments.extend([label] * assignments_per_class)
+    
+    # Fill remaining assignments if division wasn't perfect
+    remaining = (num_clients * num_classes_per_client) - len(class_assignments)
+    class_assignments.extend(np.random.choice(range(num_classes), remaining, replace=False))
+    
+    random.shuffle(class_assignments)
 
-    # Assign each client `num_classes_per_client` labels
-    all_labels = list(label_to_indices.keys())
-    client_indices = [[] for _ in range(num_clients)]
+    # Assign `num_classes_per_client` to each client from the shuffled list
+    client_to_labels = defaultdict(list)
     for client_id in range(num_clients):
-        chosen_labels = random.sample(all_labels, num_classes_per_client)
-        for label in chosen_labels:
-            num_samples = len(label_to_indices[label]) // num_clients
-            client_indices[client_id].extend(label_to_indices[label][:num_samples])
-            # Remove used indices
-            label_to_indices[label] = label_to_indices[label][num_samples:]
+        start = client_id * num_classes_per_client
+        end = start + num_classes_per_client
+        client_to_labels[client_id] = class_assignments[start:end]
+
+    # 3. Create a map from a label to the clients that have it
+    label_to_clients = defaultdict(list)
+    for client_id, labels in client_to_labels.items():
+        for label in labels:
+            label_to_clients[label].append(client_id)
+
+    # 4. Partition the data indices for each label among its assigned clients
+    client_indices = [[] for _ in range(num_clients)]
+    for label, indices in label_to_indices.items():
+        assigned_clients = label_to_clients[label]
+        
+        # If a label has no assigned clients (can happen in some configs), continue
+        if not assigned_clients:
+            continue
+            
+        # Shuffle indices for randomness
+        random.shuffle(indices)
+        
+        # Split indices among the assigned clients
+        num_chunks = len(assigned_clients)
+        chunks = np.array_split(indices, num_chunks)
+        
+        for i, client_id in enumerate(assigned_clients):
+            client_indices[client_id].extend(chunks[i])
 
     return client_indices
 
@@ -148,10 +179,6 @@ class FlowerClient(fl.client.NumPyClient):
         time.sleep(self.profile['speed'])
         process = psutil.Process()
 
-        # REMOVE OR COMMENT OUT THESE LINES TO CONVERT TO FEDAVG
-        # global_weights = [p.clone().detach().to(DEVICE) for p in self.model.parameters()]
-        # base_mu = 0.001
-        # mu = base_mu * self.profile["latency"]
 
         for _ in range(EPOCHS):
             for images, labels in self.train_loader:
@@ -205,74 +232,26 @@ def client_fn(cid: str) -> fl.client.Client:
 # -------------------------------
 # Metric Aggregation Functions
 # -------------------------------
-def fit_metrics_aggregation_fn(results: List[Tuple[fl.common.Parameters, int, Dict[str, fl.common.Scalar]]]):
-    accuracies = []
-    cpu_usages = []
-    gpu_usages = []
-    print("we need to debug this fffffffffiiiiiiiiitttttttt",results)
+def weighted_average_aggregator(
+    results: List[Tuple[int, Dict[str, Scalar]]]
+) -> Dict[str, Scalar]:
+    """
+    This correctly computes the weighted average of all metrics.
+    """
+    if not results:
+        return {}
 
-    for res in results:
-        print(res[1]["accuracy"])
-           
-        accuracies.append(res[1]["accuracy"])
-            
-        cpu_usages.append(res[1]["cpu_usage_percent"])
-            
-        gpu_usages.append(res[1]["gpu_usage_percent"])
+    # Correctly unpack the 2-element tuples
+    num_examples_list = [num_examples for num_examples, metrics in results]
+    metrics_list = [metrics for num_examples, metrics in results]
 
-    print("this is acaaaaaacuracies in evaluate metric aggregation",accuracies)
-    print("this is cpu_usages in evaluate metric aggregation",cpu_usages)
-    print("this is gpu_usages in evaluate metric aggregation",gpu_usages)
-    
+    # The rest of your logic was correct
     aggregated_metrics = {}
-    if accuracies:
-        aggregated_metrics["avg_accuracy"] = float(np.mean(accuracies))
-    else:
-        aggregated_metrics["avg_accuracy"] = 0.0 # Still debug this to get non-zero
-        
-    if cpu_usages:
-        aggregated_metrics["avg_cpu_usage_percent"] = float(np.mean(cpu_usages))
-    else:
-        aggregated_metrics["avg_cpu_usage_percent"] = 0.0
-    if gpu_usages:
-        aggregated_metrics["avg_gpu_usage_percent"] = float(np.mean(gpu_usages))
-    else:
-        aggregated_metrics["avg_gpu_usage_percent"] = 1.55
-
-    return aggregated_metrics
-
-def evaluate_metrics_aggregation_fn(results: List[Tuple[float, int, Dict[str, fl.common.Scalar]]]):
-    accuracies = []
-    cpu_usages = []
-    gpu_usages = []
-    print("evaluateeeeeeeeeeee")
-    for res in results:
-        print(res[1]["accuracy"])
-           
-        accuracies.append(res[1]["accuracy"])
-            
-        cpu_usages.append(res[1]["cpu_usage_percent"])
-            
-        gpu_usages.append(res[1]["gpu_usage_percent"])
-    print("this is acaaaaaacuracies in evaluate metric aggregation",accuracies)
-    print("this is cpu_usages in evaluate metric aggregation",cpu_usages)
-    print("this is gpu_usages in evaluate metric aggregation",gpu_usages)
-    
-    aggregated_metrics = {}
-    if accuracies:
-        aggregated_metrics["accuracy"] = float(np.mean(accuracies))
-    else:
-        aggregated_metrics["accuracy"] = 0.0
-        
-    if cpu_usages:
-        aggregated_metrics["avg_cpu_usage_percent"] = float(np.mean(cpu_usages))
-    else:
-        aggregated_metrics["avg_cpu_usage_percent"] = 0.0
-    if gpu_usages:
-        aggregated_metrics["avg_gpu_usage_percent"] = float(np.mean(gpu_usages))
-    else:
-        aggregated_metrics["avg_gpu_usage_percent"] = 1.55
-    
+    # Iterate over all metric keys (e.g., "accuracy")
+    for key in metrics_list[0].keys():
+        values = [metrics[key] for metrics in metrics_list]
+        weighted_avg = np.average(values, weights=num_examples_list)
+        aggregated_metrics[f"avg_{key}"] = float(weighted_avg)
 
     return aggregated_metrics
 
@@ -361,24 +340,6 @@ class TimedFedAvg(fl.server.strategy.FedAvg):
         
         return aggregated_parameters, aggregated_metrics
 
-    # If you also need to time evaluation rounds separately (not just fit rounds that include eval)
-    # def configure_evaluate(
-    #     self, server_round: int, parameters: fl.common.Parameters, client_manager: fl.server.client_manager.ClientManager
-    # ) -> List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateIns]]:
-    #     # Not typically needed if evaluation is part of the fit cycle or server-side
-    #     return super().configure_evaluate(server_round, parameters, client_manager)
-
-    # def aggregate_evaluate(
-    #     self,
-    #     server_round: int,
-    #     results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes]],
-    #     failures: List[Union[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes], BaseException]],
-    # ) -> Tuple[Optional[float], Dict[str, fl.common.Scalar]]:
-    #     # Only if clients perform dedicated evaluation rounds and report metrics
-    #     loss_aggregated, metrics_aggregated = super().aggregate_evaluate(server_round, results, failures)
-    #     # Add timing logic here if needed for pure evaluate rounds
-    #     return loss_aggregated, metrics_aggregated
-
 
 # -------------------------------
 # Strategy Instantiation
@@ -391,8 +352,8 @@ strategy = TimedFedAvg( # Use your custom strategy here
     fraction_evaluate=0.5,
     min_fit_clients=10,
     min_available_clients=NUM_CLIENTS,
-    fit_metrics_aggregation_fn=fit_metrics_aggregation_fn,
-    evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
+    fit_metrics_aggregation_fn=weighted_average_aggregator,
+    evaluate_metrics_aggregation_fn=weighted_average_aggregator,
     evaluate_fn=get_evaluate_fn(global_model, global_test_loader, DEVICE),
     initial_parameters=fl.common.ndarrays_to_parameters(
         [val.cpu().numpy() for val in global_model.state_dict().values()]
