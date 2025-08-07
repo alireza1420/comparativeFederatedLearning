@@ -2,7 +2,6 @@ import flwr as fl
 from flwr.client import NumPyClient
 import pandas as pd
 import numpy as np
-import csv
 import torch
 from collections import defaultdict
 import random
@@ -31,10 +30,7 @@ BATCH_SIZE = 32
 EPOCHS = 5 # Increased epochs for better learning
 DEVICE = torch.device("cuda")
 
-# CPU/GPU resources per client actor for Ray simulation backend
-# Adjust based on your system's capabilities
-# For GPU, 1.0 means one client gets full GPU, 0.0 means CPU only.
-# Fractional (e.g., 0.25) can be used for scheduling but doesn't mean true concurrent sharing on one GPU.
+
 CLIENT_RESOURCES = {"num_cpus": 1, "num_gpus": 0.1} # Start with 0.0 GPU if unsure
 
 
@@ -358,7 +354,7 @@ def main():
     history = fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=5), # Set a reasonable number of rounds for testing
+        config=fl.server.ServerConfig(num_rounds=10), # Set a reasonable number of rounds for testing
         client_resources= CLIENT_RESOURCES, # Use the defined CLIENT_RESOURCES
         strategy=strategy,
     )
